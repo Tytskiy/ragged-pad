@@ -3,8 +3,16 @@ import math
 import pytest
 import torch
 
-from yrec.nn import get_mask
-from yrec.nn.ragged import pad, unpad
+from ragged_pad import pad, unpad
+
+
+def get_mask(lengths, maxlen=None):
+    """[2, 3, 1] -> [[True,  True,  False],
+    [True,  True,  True ],
+    [True,  False, False]])"""
+    if maxlen is None:
+        maxlen = lengths.max().item()
+    return torch.arange(maxlen, device=lengths.device)[None, :] < lengths[:, None]
 
 
 def naive_pad(
@@ -35,7 +43,7 @@ def naive_pad(
     return padded_flat.reshape(out_shape)
 
 
-def naive_unpadding(x: torch.Tensor, lengths: torch.Tensor, dim: int = 0) -> torch.Tensor:
+def naive_unpad(x: torch.Tensor, lengths: torch.Tensor, dim: int = 0) -> torch.Tensor:
     """Naive unpadding that works for arbitrary dimension."""
     dim = dim % x.dim()
     batch_size = lengths.shape[0]
@@ -63,6 +71,7 @@ def naive_unpadding(x: torch.Tensor, lengths: torch.Tensor, dim: int = 0) -> tor
     return out_flat.reshape(out_shape)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_simple_forward():
     torch.manual_seed(42)
 
@@ -84,10 +93,11 @@ def test_simple_forward():
 
     padded = torch.randn(batch_size, max_seqlen, D, device="cuda", dtype=torch.bfloat16)
     triton_out = unpad(padded, lengths, cu_lengths, varlen)
-    naive_out = naive_unpadding(padded, lengths)
+    naive_out = naive_unpad(padded, lengths)
     assert torch.allclose(triton_out, naive_out), "Unpadding mismatch!"
 
 
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_backward_simple():
     torch.manual_seed(42)
 
@@ -118,7 +128,7 @@ def test_backward_simple():
     padded_naive = padded_triton.detach().clone().requires_grad_(True)
 
     triton_out = unpad(padded_triton, lengths, cu_lengths, varlen)
-    naive_out = naive_unpadding(padded_naive, lengths)
+    naive_out = naive_unpad(padded_naive, lengths)
 
     grad_out = torch.randn_like(triton_out)
     triton_out.backward(grad_out)
@@ -161,6 +171,7 @@ def ragged_fixture():
 
 
 @pytest.mark.parametrize("prefix_shape,suffix_shape,dim", MULTIDIM_CONFIGS)
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_pad_forward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim):
     """Test padding forward with various dimension configurations."""
     batch_size = ragged_fixture["batch_size"]
@@ -182,6 +193,7 @@ def test_pad_forward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim):
 
 
 @pytest.mark.parametrize("prefix_shape,suffix_shape,dim", MULTIDIM_CONFIGS)
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_unpad_forward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim):
     """Test unpadding forward with various dimension configurations."""
     batch_size = ragged_fixture["batch_size"]
@@ -195,13 +207,14 @@ def test_unpad_forward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim)
 
     padded = torch.randn(input_shape, device="cuda", dtype=torch.bfloat16)
     triton_out = unpad(padded, lengths, cu_lengths, varlen, dim=dim)
-    naive_out = naive_unpadding(padded, lengths, dim=dim)
+    naive_out = naive_unpad(padded, lengths, dim=dim)
 
     assert triton_out.shape == expected_shape, f"Shape mismatch: {triton_out.shape} != {expected_shape}"
     assert torch.allclose(triton_out, naive_out), "Unpadding mismatch!"
 
 
 @pytest.mark.parametrize("prefix_shape,suffix_shape,dim", MULTIDIM_CONFIGS)
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_pad_backward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim):
     """Test padding backward with various dimension configurations."""
     max_seqlen = ragged_fixture["max_seqlen"]
@@ -228,6 +241,7 @@ def test_pad_backward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim):
 
 
 @pytest.mark.parametrize("prefix_shape,suffix_shape,dim", MULTIDIM_CONFIGS)
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_unpad_backward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim):
     """Test unpadding backward with various dimension configurations."""
     batch_size = ragged_fixture["batch_size"]
@@ -242,7 +256,7 @@ def test_unpad_backward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim
     padded_naive = padded_triton.detach().clone().requires_grad_(True)
 
     triton_out = unpad(padded_triton, lengths, cu_lengths, varlen, dim=dim)
-    naive_out = naive_unpadding(padded_naive, lengths, dim=dim)
+    naive_out = naive_unpad(padded_naive, lengths, dim=dim)
 
     grad_out = torch.randn_like(triton_out)
     triton_out.backward(grad_out)
@@ -252,6 +266,111 @@ def test_unpad_backward_multidim(ragged_fixture, prefix_shape, suffix_shape, dim
     assert torch.allclose(padded_triton.grad, padded_naive.grad, atol=1e-5), (
         f"Unpadding backward mismatch! Max diff: {(padded_triton.grad - padded_naive.grad).abs().max()}"
     )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
+def test_non_contiguous_forward():
+    torch.manual_seed(42)
+
+    batch_size = 4
+    max_seqlen = 32
+    prefix = 2
+    suffix = 16
+
+    lengths = torch.randint(1, max_seqlen + 1, (batch_size,), device="cuda", dtype=torch.int32)
+    cu_lengths = torch.cat([torch.zeros(1, device="cuda", dtype=torch.int32), torch.cumsum(lengths, dim=0)])
+    varlen = int(lengths.sum().item())
+
+    # Test pad: (suffix, prefix, varlen) -> permute -> (prefix, varlen, suffix) non-contiguous
+    x_base = torch.randn(suffix, prefix, varlen, device="cuda", dtype=torch.bfloat16)
+    x_non_contig = x_base.permute(1, 2, 0)
+    assert not x_non_contig.is_contiguous()
+
+    x_contig = x_non_contig.contiguous()
+
+    triton_out = pad(x_non_contig, lengths, cu_lengths, max_seqlen, dim=1)
+    expected_out = pad(x_contig, lengths, cu_lengths, max_seqlen, dim=1)
+    assert torch.allclose(triton_out, expected_out), "Non-contiguous pad mismatch!"
+
+    # Test unpad: (suffix, prefix, batch_size, max_seqlen) -> permute -> (prefix, batch_size, max_seqlen, suffix)
+    padded_base = torch.randn(suffix, prefix, batch_size, max_seqlen, device="cuda", dtype=torch.bfloat16)
+    padded_non_contig = padded_base.permute(1, 2, 3, 0)
+    assert not padded_non_contig.is_contiguous()
+
+    padded_contig = padded_non_contig.contiguous()
+
+    triton_out = unpad(padded_non_contig, lengths, cu_lengths, varlen, dim=1)
+    expected_out = unpad(padded_contig, lengths, cu_lengths, varlen, dim=1)
+    assert torch.allclose(triton_out, expected_out), "Non-contiguous unpad mismatch!"
+
+
+@pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
+def test_non_contiguous_backward():
+    torch.manual_seed(45)
+
+    batch_size = 4
+    max_seqlen = 32
+    prefix = 2
+    suffix = 16
+
+    lengths = torch.randint(1, max_seqlen + 1, (batch_size,), device="cuda", dtype=torch.int32)
+    cu_lengths = torch.cat([torch.zeros(1, device="cuda", dtype=torch.int32), torch.cumsum(lengths, dim=0)])
+    varlen = int(lengths.sum().item())
+
+    # Test pad backward
+    x_base = torch.randn(suffix, prefix, varlen, device="cuda", dtype=torch.float32)
+    x_non_contig = x_base.permute(1, 2, 0).requires_grad_(True)
+    x_contig = x_non_contig.detach().contiguous().requires_grad_(True)
+
+    out_non_contig = pad(x_non_contig, lengths, cu_lengths, max_seqlen, dim=1)
+    out_contig = pad(x_contig, lengths, cu_lengths, max_seqlen, dim=1)
+
+    grad_out = torch.randn_like(out_non_contig)
+    out_non_contig.backward(grad_out)
+    out_contig.backward(grad_out)
+
+    assert x_non_contig.grad is not None and x_contig.grad is not None
+    assert torch.allclose(x_non_contig.grad, x_contig.grad, atol=1e-5), (
+        f"Non-contiguous pad backward mismatch! Max diff: {(x_non_contig.grad - x_contig.grad).abs().max()}"
+    )
+
+    # Test unpad backward
+    padded_base = torch.randn(suffix, prefix, batch_size, max_seqlen, device="cuda", dtype=torch.float32)
+    padded_non_contig = padded_base.permute(1, 2, 3, 0).requires_grad_(True)
+    padded_contig = padded_non_contig.detach().contiguous().requires_grad_(True)
+
+    out_non_contig = unpad(padded_non_contig, lengths, cu_lengths, varlen, dim=1)
+    out_contig = unpad(padded_contig, lengths, cu_lengths, varlen, dim=1)
+
+    grad_out = torch.randn_like(out_non_contig)
+    out_non_contig.backward(grad_out)
+    out_contig.backward(grad_out)
+
+    assert padded_non_contig.grad is not None and padded_contig.grad is not None
+    assert torch.allclose(padded_non_contig.grad, padded_contig.grad, atol=1e-5), (
+        f"Non-contiguous unpad backward mismatch! Max diff: {(padded_non_contig.grad - padded_contig.grad).abs().max()}"
+    )
+
+
+@torch.compile()
+def naive_pad_bench(x: torch.Tensor, lengths: torch.Tensor, max_seqlen: int) -> torch.Tensor:
+    """
+    Naive padding implementation.
+    """
+    padded_x = x.new_zeros((lengths.shape[0], max_seqlen, x.shape[-1]))
+
+    mask = get_mask(lengths, maxlen=max_seqlen)
+    padded_x[mask] = x
+
+    return padded_x
+
+
+@torch.compile()
+def naive_unpad_bench(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """
+    Naive unpadding implementation.
+    """
+    return x[get_mask(lengths, maxlen=x.shape[1])]
 
 
 def benchmark():
@@ -282,7 +401,7 @@ def benchmark():
     # Warmup
     for _ in range(n_warmup):
         _ = pad(x, lengths, cu_lengths, max_seqlen)
-        _ = naive_pad(x, lengths, max_seqlen)
+        _ = naive_pad_bench(x, lengths, max_seqlen)
     torch.cuda.synchronize()
 
     # Triton
@@ -295,7 +414,7 @@ def benchmark():
     # Naive
     start = time.perf_counter()
     for _ in range(n_iters):
-        _ = naive_pad(x, lengths, max_seqlen)
+        _ = naive_pad_bench(x, lengths, max_seqlen)
     torch.cuda.synchronize()
     naive_time = (time.perf_counter() - start) / n_iters * 1000
 
@@ -310,7 +429,7 @@ def benchmark():
     # Warmup
     for _ in range(n_warmup):
         _ = unpad(padded, lengths, cu_lengths, varlen)
-        _ = naive_unpadding(padded, lengths)
+        _ = naive_unpad_bench(padded, lengths)
     torch.cuda.synchronize()
 
     # Triton
@@ -323,7 +442,7 @@ def benchmark():
     # Naive
     start = time.perf_counter()
     for _ in range(n_iters):
-        _ = naive_unpadding(padded, lengths)
+        _ = naive_unpad_bench(padded, lengths)
     torch.cuda.synchronize()
     naive_time = (time.perf_counter() - start) / n_iters * 1000
 

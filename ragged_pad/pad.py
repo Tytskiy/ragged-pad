@@ -27,10 +27,13 @@ def _pad_kernel(
     out_ptr,  # (outer_batch, B, max_seqlen, D)
     cu_lengths_ptr,  # (B + 1,)
     lengths_ptr,  # (B,)
+    # Input strides (support non-contiguous tensors)
+    stride_x_outer,
+    stride_x_seq,
+    stride_x_d,
     D: tl.constexpr,
     max_seqlen: tl.constexpr,
     max_seqlen_bucket: tl.constexpr,  # used only for autotune key
-    varlen_total: tl.constexpr,  # total varlen for input stride
     B: tl.constexpr,  # batch size
     BLOCK_SEQ: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -43,7 +46,6 @@ def _pad_kernel(
     seq_start = tl.load(cu_lengths_ptr + batch_idx)
     seq_len = tl.load(lengths_ptr + batch_idx)
 
-    x_base = outer_batch_idx * varlen_total * D
     out_base = outer_batch_idx * B * max_seqlen * D + batch_idx * max_seqlen * D
 
     for s in range(BLOCK_SEQ):
@@ -53,12 +55,13 @@ def _pad_kernel(
             out_offset = out_base + seq_idx * D
 
             if seq_idx < seq_len:
-                x_offset = x_base + (seq_start + seq_idx) * D
+                x_offset = (outer_batch_idx * stride_x_outer +
+                           (seq_start + seq_idx) * stride_x_seq)
 
                 for d_start in range(0, D, BLOCK_D):
                     d_offsets = d_start + tl.arange(0, BLOCK_D)
                     mask = d_offsets < D
-                    vals = tl.load(x_ptr + x_offset + d_offsets, mask=mask, other=0.0)
+                    vals = tl.load(x_ptr + x_offset + d_offsets * stride_x_d, mask=mask, other=0.0)
                     tl.store(out_ptr + out_offset + d_offsets, vals, mask=mask)
 
 
@@ -70,7 +73,7 @@ def _pad(
     pad_value: float = 0.0,
     dim: int = 0,
 ) -> torch.Tensor:
-    assert x.is_contiguous()
+    # lengths and cu_lengths must be contiguous (small tensors, cheap to ensure)
     assert lengths.is_contiguous()
     assert cu_lengths.is_contiguous()
 
@@ -83,20 +86,27 @@ def _pad(
         x.shape, dim, is_pad=True, batch_size=batch_size, max_seqlen=max_seqlen, varlen=varlen
     )
 
+    # Reshape to canonical 3D form: (outer_batch, varlen, D)
+    # This may return a view (non-contiguous OK) or copy if view is impossible
+    canon_x = x.reshape(outer_batch, varlen, D)
+    stride_x_outer, stride_x_seq, stride_x_d = canon_x.stride()
+
     out = x.new_full(out_shape, fill_value=pad_value)
 
     def grid(meta):
         return (outer_batch * batch_size, triton.cdiv(max_seqlen, meta["BLOCK_SEQ"]))
 
     _pad_kernel[grid](
-        x,
+        canon_x,
         out,
         cu_lengths,
         lengths,
+        stride_x_outer=stride_x_outer,
+        stride_x_seq=stride_x_seq,
+        stride_x_d=stride_x_d,
         D=D,
         max_seqlen=max_seqlen,
         max_seqlen_bucket=_bucket_seqlen(max_seqlen),
-        varlen_total=varlen,
         B=batch_size,
     )
 
@@ -110,6 +120,10 @@ def _unpad_kernel(
     out_ptr,  # (outer_batch, varlen, D)
     cu_lengths_ptr,  # (B + 1,)
     lengths_ptr,  # (B,)
+    stride_p_outer,
+    stride_p_batch,
+    stride_p_seq,
+    stride_p_d,
     D: tl.constexpr,
     max_seqlen: tl.constexpr,
     max_seqlen_bucket: tl.constexpr,  # used only for autotune key
@@ -126,53 +140,62 @@ def _unpad_kernel(
     seq_start = tl.load(cu_lengths_ptr + batch_idx)
     seq_len = tl.load(lengths_ptr + batch_idx)
 
-    padded_base = outer_batch_idx * B * max_seqlen * D + batch_idx * max_seqlen * D
     out_base = outer_batch_idx * varlen_total * D
 
     for s in range(BLOCK_SEQ):
         seq_idx = seq_block_idx * BLOCK_SEQ + s
 
         if seq_idx < seq_len:
-            padded_offset = padded_base + seq_idx * D
+            padded_offset = (outer_batch_idx * stride_p_outer +
+                            batch_idx * stride_p_batch +
+                            seq_idx * stride_p_seq)
             out_offset = out_base + (seq_start + seq_idx) * D
 
             for d_start in range(0, D, BLOCK_D):
                 d_offsets = d_start + tl.arange(0, BLOCK_D)
                 mask = d_offsets < D
-                vals = tl.load(padded_ptr + padded_offset + d_offsets, mask=mask, other=0.0)
+                vals = tl.load(padded_ptr + padded_offset + d_offsets * stride_p_d, mask=mask, other=0.0)
                 tl.store(out_ptr + out_offset + d_offsets, vals, mask=mask)
 
 
 def _unpad(
-    padded: torch.Tensor,
+    x: torch.Tensor,
     lengths: torch.Tensor,
     cu_lengths: torch.Tensor,
     varlen: int,
     dim: int = 0,
 ) -> torch.Tensor:
-    assert padded.is_contiguous()
     assert lengths.is_contiguous()
     assert cu_lengths.is_contiguous()
 
-    dim = dim % padded.dim()
+    dim = dim % x.dim()
 
     batch_size = lengths.shape[0]
-    max_seqlen = padded.shape[dim + 1]
+    max_seqlen = x.shape[dim + 1]
 
     outer_batch, D, out_shape = _compute_shapes(
-        padded.shape, dim, is_pad=False, batch_size=batch_size, max_seqlen=max_seqlen, varlen=varlen
+        x.shape, dim, is_pad=False, batch_size=batch_size, max_seqlen=max_seqlen, varlen=varlen
     )
 
-    out = torch.empty(out_shape, device=padded.device, dtype=padded.dtype)
+    # Reshape to canonical 4D form: (outer_batch, batch_size, max_seqlen, D)
+    # This may return a view (non-contiguous OK) or copy if view is impossible
+    canon_x = x.reshape(outer_batch, batch_size, max_seqlen, D)
+    stride_p_outer, stride_p_batch, stride_p_seq, stride_p_d = canon_x.stride()
+
+    out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
 
     def grid(meta):
         return (outer_batch * batch_size, triton.cdiv(max_seqlen, meta["BLOCK_SEQ"]))
 
     _unpad_kernel[grid](
-        padded,
+        canon_x,
         out,
         cu_lengths,
         lengths,
+        stride_p_outer=stride_p_outer,
+        stride_p_batch=stride_p_batch,
+        stride_p_seq=stride_p_seq,
+        stride_p_d=stride_p_d,
         D=D,
         max_seqlen=max_seqlen,
         max_seqlen_bucket=_bucket_seqlen(max_seqlen),
