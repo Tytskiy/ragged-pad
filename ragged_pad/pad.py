@@ -51,18 +51,17 @@ def _pad_kernel(
     for s in range(BLOCK_SEQ):
         seq_idx = seq_block_idx * BLOCK_SEQ + s
 
-        if seq_idx < max_seqlen:
-            out_offset = out_base + seq_idx * D
+        out_offset = out_base + seq_idx * D
 
-            if seq_idx < seq_len:
-                x_offset = (outer_batch_idx * stride_x_outer +
-                           (seq_start + seq_idx) * stride_x_seq)
+        if seq_idx < seq_len:
+            x_offset = (outer_batch_idx * stride_x_outer +
+                        (seq_start + seq_idx) * stride_x_seq)
 
-                for d_start in range(0, D, BLOCK_D):
-                    d_offsets = d_start + tl.arange(0, BLOCK_D)
-                    mask = d_offsets < D
-                    vals = tl.load(x_ptr + x_offset + d_offsets * stride_x_d, mask=mask, other=0.0)
-                    tl.store(out_ptr + out_offset + d_offsets, vals, mask=mask)
+            for d_start in range(0, D, BLOCK_D):
+                d_offsets = d_start + tl.arange(0, BLOCK_D)
+                mask = d_offsets < D
+                vals = tl.load(x_ptr + x_offset + d_offsets * stride_x_d, mask=mask, other=0.0)
+                tl.store(out_ptr + out_offset + d_offsets, vals, mask=mask)
 
 
 def _pad(

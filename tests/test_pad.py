@@ -70,7 +70,6 @@ def naive_unpad(x: torch.Tensor, lengths: torch.Tensor, dim: int = 0) -> torch.T
 
     return out_flat.reshape(out_shape)
 
-
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_simple_forward():
     torch.manual_seed(42)
@@ -95,7 +94,6 @@ def test_simple_forward():
     triton_out = unpad(padded, lengths, cu_lengths, varlen)
     naive_out = naive_unpad(padded, lengths)
     assert torch.allclose(triton_out, naive_out), "Unpadding mismatch!"
-
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_backward_simple():
@@ -303,7 +301,6 @@ def test_non_contiguous_forward():
     expected_out = unpad(padded_contig, lengths, cu_lengths, varlen, dim=1)
     assert torch.allclose(triton_out, expected_out), "Non-contiguous unpad mismatch!"
 
-
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="Requires at least 1 gpu")
 def test_non_contiguous_backward():
     torch.manual_seed(45)
@@ -351,7 +348,6 @@ def test_non_contiguous_backward():
         f"Non-contiguous unpad backward mismatch! Max diff: {(padded_non_contig.grad - padded_contig.grad).abs().max()}"
     )
 
-
 @torch.compile()
 def naive_pad_bench(x: torch.Tensor, lengths: torch.Tensor, max_seqlen: int) -> torch.Tensor:
     """
@@ -363,7 +359,6 @@ def naive_pad_bench(x: torch.Tensor, lengths: torch.Tensor, max_seqlen: int) -> 
     padded_x[mask] = x
 
     return padded_x
-
 
 @torch.compile()
 def naive_unpad_bench(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
